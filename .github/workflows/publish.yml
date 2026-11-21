@@ -12,10 +12,15 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  # needed to delete artifacts left behind by earlier attempts of the same run
+  actions: write
 
 concurrency:
   group: pages
   cancel-in-progress: true
+
+env:
+  ARTIFACT_NAME: github-pages
 
 jobs:
   publish:
@@ -24,16 +29,16 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: Granit1846/logbook-site
           sparse-checkout: |
             /*
             !/public/downloads/
           sparse-checkout-cone-mode: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
       - run: npm ci
       - run: npm run build
@@ -42,8 +47,52 @@ jobs:
           VITE_SUPABASE_ANON_KEY: ${{ vars.VITE_SUPABASE_ANON_KEY }}
       # Hash routing only; 404.html keeps deep links working, .nojekyll serves files as they are.
       - run: cp dist/index.html dist/404.html && touch dist/.nojekyll
-      - uses: actions/upload-pages-artifact@v3
+
+      # "Re-run jobs" keeps the artifacts of the previous attempts on the same run, while
+      # deploy-pages looks the artifact up by name and expects exactly one of them.
+      # Without this, the second re-run dies with
+      #   Multiple artifacts named "github-pages" were unexpectedly found ... count is 2.
+      - name: Drop artifacts left by earlier attempts of this run
+        if: github.run_attempt > 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts"
+          curl -sfL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "${api}?per_page=100" \
+            | jq -r --arg name "${ARTIFACT_NAME}" '.artifacts[] | select(.name==$name) | .id' \
+            | while read -r id; do
+                echo "deleting stale artifact ${id}"
+                curl -sfL -X DELETE -H "Authorization: Bearer ${GH_TOKEN}" \
+                  "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}"
+              done
+
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: dist
+
+      # The artifacts API is eventually consistent: right after the upload deploy-pages
+      # asks once, sees zero artifacts and gives up with
+      #   No artifacts named "github-pages" were found for this workflow run.
+      # That is what broke the scheduled run on 2026-11-21, and every retry after it.
+      # Wait until the artifact is really visible before handing over to deploy-pages.
+      - name: Wait until the artifact is visible to the API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts"
+          for attempt in $(seq 1 30); do
+            count=$(curl -sfL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+              "${api}?per_page=100" \
+              | jq -r --arg name "${ARTIFACT_NAME}" '[.artifacts[] | select(.name==$name)] | length')
+            echo "poll ${attempt}: ${count} artifact(s) named ${ARTIFACT_NAME} visible"
+            if [ "${count}" -ge 1 ]; then exit 0; fi
+            sleep 2
+          done
+          echo "::error::artifact ${ARTIFACT_NAME} never became visible to the artifacts API"
+          exit 1
+
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
