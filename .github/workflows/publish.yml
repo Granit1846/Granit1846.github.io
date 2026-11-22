@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deploy_attempt1.outputs.page_url || steps.deploy_attempt2.outputs.page_url }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -72,59 +72,23 @@ jobs:
         with:
           path: dist
 
-      # deploy-pages does not read the public REST artifacts API. It lists artifacts through
-      # @actions/artifact against the internal results service (ACTIONS_RESULTS_URL), and
-      # that index trails the finished upload by a second or two. deploy-pages asks exactly
-      # once, so the scheduled run on 2026-11-22 16:30Z died with
-      #   No artifacts named "github-pages" were found for this workflow run
-      # although the artifact was already there and visible over REST.
-      # Ask the very same service deploy-pages uses, so its single-shot question is already
-      # answered by the time it runs. This runs as a JS action (github-script) because only
-      # JS actions get ACTIONS_RESULTS_URL and ACTIONS_RUNTIME_TOKEN in their environment;
-      # a plain `run:` step does not.
-      - name: Wait until deploy-pages can see the artifact
-        uses: actions/github-script@v9
-        with:
-          script: |
-            const name = 'github-pages'
-            const base = (process.env.ACTIONS_RESULTS_URL || '').replace(/\/+$/, '')
-            const token = process.env.ACTIONS_RUNTIME_TOKEN
-            const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+      # deploy-pages asks the artifact service exactly once, and that index can trail the
+      # finished upload by a second or two. That race killed the scheduled runs of
+      # 2026-11-21 15:44Z ("No artifacts named github-pages were found") and
+      # 2026-11-22 16:30Z — in the second one the public REST artifacts API already
+      # reported the artifact 0.7 s before deploy-pages saw an empty list.
+      # deploy-pages reads an internal service, not the REST API: no token for it is
+      # available to a run step, and actions/github-script gets a token the endpoint
+      # rejects with HTTP 401. So do not guess at that index at all — just ask
+      # deploy-pages again after a pause. A failed first attempt stops before touching Pages.
+      - id: deploy_attempt1
+        continue-on-error: true
+        uses: actions/deploy-pages@v5
 
-            if (!base || !token) {
-              core.warning('ACTIONS_RESULTS_URL/ACTIONS_RUNTIME_TOKEN are missing; sleeping instead of polling')
-              await sleep(20000)
-              return
-            }
+      - name: Pause before retrying the deployment
+        if: steps.deploy_attempt1.outcome == 'failure'
+        run: sleep 20
 
-            const deadline = Date.now() + 90000
-            let clean = 0
-            while (Date.now() < deadline) {
-              let count = -1
-              try {
-                const res = await fetch(`${base}/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts`, {
-                  method: 'POST',
-                  headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-                  body: '{}'
-                })
-                if (res.ok) {
-                  const body = await res.json()
-                  count = (body.artifacts || []).filter(a => a.name === name).length
-                  core.info(`${count} artifact(s) named ${name} visible to the results service`)
-                } else {
-                  core.info(`ListArtifacts responded HTTP ${res.status}`)
-                }
-              } catch (error) {
-                core.info(`ListArtifacts request failed: ${error.message}`)
-              }
-              if (count === 1) { clean += 1 } else { clean = 0 }
-              if (clean >= 2) {
-                core.info('artifact is indexed, handing over to deploy-pages')
-                return
-              }
-              await sleep(2000)
-            }
-            core.setFailed(`the results service never reported exactly one ${name} artifact`)
-
-      - id: deployment
+      - id: deploy_attempt2
+        if: steps.deploy_attempt1.outcome == 'failure'
         uses: actions/deploy-pages@v5
