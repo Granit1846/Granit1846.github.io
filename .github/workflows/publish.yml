@@ -49,7 +49,7 @@ jobs:
       - run: cp dist/index.html dist/404.html && touch dist/.nojekyll
 
       # "Re-run jobs" keeps the artifacts of the previous attempts on the same run, while
-      # deploy-pages looks the artifact up by name and expects exactly one of them.
+      # deploy-pages expects exactly one artifact with this name in the run.
       # Without this, the second re-run dies with
       #   Multiple artifacts named "github-pages" were unexpectedly found ... count is 2.
       - name: Drop artifacts left by earlier attempts of this run
@@ -72,26 +72,62 @@ jobs:
         with:
           path: dist
 
-      # The artifacts API is eventually consistent: right after the upload deploy-pages
-      # asks once, sees zero artifacts and gives up with
-      #   No artifacts named "github-pages" were found for this workflow run.
-      # That is what broke the scheduled run on 2026-11-21, and every retry after it.
-      # Wait until the artifact is really visible before handing over to deploy-pages.
-      - name: Wait until the artifact is visible to the API
+      # deploy-pages does not read the public REST artifacts API. It lists artifacts through
+      # @actions/artifact against the internal results service (ACTIONS_RESULTS_URL), and
+      # that index trails the finished upload by a second or two. deploy-pages asks exactly
+      # once, so the scheduled run on 2026-11-22 16:30Z died with
+      #   No artifacts named "github-pages" were found for this workflow run
+      # although the artifact was already there and visible over REST.
+      # Poll the very same service deploy-pages uses until it agrees, so its single-shot
+      # question is already answered by the time it runs.
+      - name: Wait until deploy-pages can see the artifact
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts"
-          for attempt in $(seq 1 30); do
-            count=$(curl -sfL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
-              "${api}?per_page=100" \
-              | jq -r --arg name "${ARTIFACT_NAME}" '[.artifacts[] | select(.name==$name)] | length')
-            echo "poll ${attempt}: ${count} artifact(s) named ${ARTIFACT_NAME} visible"
-            if [ "${count}" -ge 1 ]; then exit 0; fi
+          rest_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts"
+
+          count_via_results_service() {
+            curl -sf --max-time 20 -X POST \
+              "${ACTIONS_RESULTS_URL%/}/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts" \
+              -H "Authorization: Bearer ${ACTIONS_RUNTIME_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{}' \
+              | jq -r --arg name "${ARTIFACT_NAME}" '[(.artifacts // [])[] | select(.name==$name)] | length' \
+              || echo 0
+          }
+
+          count_via_rest() {
+            curl -sfL --max-time 20 -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" "${rest_api}?per_page=100" \
+              | jq -r --arg name "${ARTIFACT_NAME}" '[(.artifacts // [])[] | select(.name==$name)] | length' \
+              || echo 0
+          }
+
+          # The token above is normally exposed to run steps on GitHub-hosted runners.
+          # If it ever is not, fall back to the REST API plus a fixed settle delay.
+          if [ -z "${ACTIONS_RESULTS_URL:-}" ] || [ -z "${ACTIONS_RUNTIME_TOKEN:-}" ]; then
+            echo "::warning::ACTIONS_RESULTS_URL or ACTIONS_RUNTIME_TOKEN is not exposed to run steps; falling back to a fixed settle delay"
+            for attempt in $(seq 1 30); do
+              count=$(count_via_rest)
+              echo "poll ${attempt}: ${count} artifact(s) named ${ARTIFACT_NAME} visible (REST)"
+              if [ "${count}" -ge 1 ]; then break; fi
+              sleep 2
+            done
+            sleep 15
+            exit 0
+          fi
+
+          # Two consecutive clean readings: a single one can catch the index mid-update.
+          clean=0
+          for attempt in $(seq 1 45); do
+            count=$(count_via_results_service)
+            echo "poll ${attempt}: ${count} artifact(s) named ${ARTIFACT_NAME} visible to the results service"
+            if [ "${count}" -eq 1 ]; then clean=$((clean + 1)); else clean=0; fi
+            if [ "${clean}" -ge 2 ]; then exit 0; fi
             sleep 2
           done
-          echo "::error::artifact ${ARTIFACT_NAME} never became visible to the artifacts API"
+          echo "::error::the results service never reported exactly one ${ARTIFACT_NAME} artifact"
           exit 1
 
       - id: deployment
