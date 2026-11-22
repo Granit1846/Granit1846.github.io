@@ -84,8 +84,6 @@ jobs:
       - id: deploy_attempt1
         continue-on-error: true
         uses: actions/deploy-pages@v5
-        with:
-          artifact_name: wiring-check-does-not-exist
 
       - name: Pause before retrying the deployment
         if: steps.deploy_attempt1.outcome == 'failure'
